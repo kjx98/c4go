@@ -5,6 +5,10 @@ package transpiler
 import (
 	"bytes"
 	"fmt"
+	goast "go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"strconv"
 	"strings"
 
@@ -12,11 +16,6 @@ import (
 	"github.com/Konstantin8105/c4go/program"
 	"github.com/Konstantin8105/c4go/types"
 	"github.com/Konstantin8105/c4go/util"
-
-	goast "go/ast"
-	"go/parser"
-	"go/printer"
-	"go/token"
 )
 
 func getMemberName(firstChild ast.Node) (name string, ok bool) {
@@ -355,7 +354,7 @@ func transpileCallExpr(n *ast.CallExpr, p *program.Program) (
 		}
 		if len(n.Children()) > 0 {
 			if v, ok := n.Children()[0].(*ast.ImplicitCastExpr); ok &&
-				(types.IsFunction(v.Type) || types.IsTypedefFunction(p, v.Type)) {
+				(util.IsFunction(v.Type) || types.IsTypedefFunction(p, v.Type)) {
 				t := v.Type
 				if v, ok := p.TypedefType[t]; ok {
 					t = v
@@ -365,7 +364,7 @@ func transpileCallExpr(n *ast.CallExpr, p *program.Program) (
 						t = p.TypedefType[t]
 					}
 				}
-				prefix, fields, returns, err := types.ParseFunction(t)
+				prefix, _, fields, returns, err := util.ParseFunction(t)
 				if err != nil {
 					p.AddMessage(p.GenerateWarningMessage(fmt.Errorf(
 						"Cannot resolve function : %v", err), n))
@@ -409,9 +408,34 @@ func transpileCallExpr(n *ast.CallExpr, p *program.Program) (
 	args := []goast.Expr{}
 	argTypes := []string{}
 	i := 0
-
 	for _, arg := range n.Children()[1:] {
-		e, eType, newPre, newPost, err := transpileToExpr(arg, p, false)
+		if bin, ok := arg.(*ast.BinaryOperator); ok && bin.Operator == "=" {
+			// example :
+			// from :
+			// call(val = 43);
+			// to:
+			// call(val = 43,val);
+			var b ast.BinaryOperator
+			b.Type = bin.Type
+			b.Operator = ","
+			b.AddChild(arg)
+			b.AddChild(bin.Children()[0])
+			arg = &b
+		}
+		if cmp, ok := arg.(*ast.CompoundAssignOperator); ok {
+			// example :
+			// from :
+			// call(val += 43);
+			// to:
+			// call(val += 43,val);
+			var b ast.BinaryOperator
+			b.Type = cmp.Type
+			b.Operator = ","
+			b.AddChild(arg)
+			b.AddChild(cmp.Children()[0])
+			arg = &b
+		}
+		e, eType, newPre, newPost, err := atomicOperation(arg, p)
 		if err != nil {
 			err = fmt.Errorf("argument position is %d. %v", i, err)
 			p.AddMessage(p.GenerateWarningMessage(err, arg))
@@ -513,7 +537,7 @@ func transpileCallExpr(n *ast.CallExpr, p *program.Program) (
 			}
 
 			if len(functionDef.ArgumentTypes) > i {
-				if !types.IsPointer(functionDef.ArgumentTypes[i]) {
+				if !util.IsPointer(functionDef.ArgumentTypes[i]) {
 					if strings.HasPrefix(functionDef.ArgumentTypes[i], "union ") {
 						a = &goast.CallExpr{
 							Fun: &goast.SelectorExpr{
